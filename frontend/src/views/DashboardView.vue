@@ -118,11 +118,12 @@ async function rename(kind, item) {
 async function remove(kind, item) {
   const isFolder = kind === 'folders'
   const ok = await confirmDialog({
-    title: isFolder ? 'Delete folder?' : 'Delete file?',
-    message: `"${item.name}"${isFolder ? ' and everything inside it' : ''} will be permanently deleted.`,
+    title: isFolder ? 'Move folder to trash?' : 'Move file to trash?',
+    message: `"${item.name}"${isFolder ? ' and everything inside it' : ''} will be moved to the trash. You can restore it from there.`,
+    confirmText: 'Move to trash',
   })
   if (!ok) return
-  run(() => api.del(`/api/${kind}/${item.id}`), `"${item.name}" deleted`)
+  run(() => api.del(`/api/${kind}/${item.id}`), `"${item.name}" moved to trash`)
 }
 
 function onFilesPicked(e) {
@@ -167,6 +168,7 @@ async function logout() {
     <header class="topbar">
       <strong class="brand">Mini-Drive</strong>
       <StorageMeter ref="meter" class="topbar-meter" />
+      <RouterLink to="/trash">Trash</RouterLink>
       <span class="user">{{ auth.user?.username }}</span>
       <button type="button" @click="logout">Logout</button>
     </header>
@@ -221,7 +223,7 @@ async function logout() {
         :files="files"
         @open-folder="openFolder"
         @preview="(f) => (preview = f)"
-        @share="(f) => (sharing = f)"
+        @share="(kind, item) => (sharing = { kind, item })"
         @rename="rename"
         @remove="remove"
       />
@@ -242,6 +244,7 @@ async function logout() {
             <td class="num">—</td>
             <td class="date">{{ formatDate(f.created_at) }}</td>
             <td class="row-actions">
+              <button type="button" @click="sharing = { kind: 'folders', item: f }" :aria-label="`Share ${f.name}`">Share</button>
               <button type="button" @click="rename('folders', f)" :aria-label="`Rename ${f.name}`">Rename</button>
               <button type="button" class="danger" @click="remove('folders', f)" :aria-label="`Delete ${f.name}`">Delete</button>
             </td>
@@ -260,7 +263,7 @@ async function logout() {
             <td class="date">{{ formatDate(f.created_at) }}</td>
             <td class="row-actions">
               <a class="btn" :href="'/api/files/download/' + f.id" download :aria-label="`Download ${f.name}`">Download</a>
-              <button type="button" @click="sharing = f" :aria-label="`Share ${f.name}`">Share</button>
+              <button type="button" @click="sharing = { kind: 'files', item: f }" :aria-label="`Share ${f.name}`">Share</button>
               <button type="button" @click="rename('files', f)" :aria-label="`Rename ${f.name}`">Rename</button>
               <button type="button" class="danger" @click="remove('files', f)" :aria-label="`Delete ${f.name}`">Delete</button>
             </td>
@@ -272,7 +275,7 @@ async function logout() {
     </main>
 
     <FilePreview v-if="preview" :file="preview" @close="preview = null" />
-    <ShareDialog v-if="sharing" :file="sharing" @close="sharing = null; refreshUsage()" />
+    <ShareDialog v-if="sharing" :file="sharing.item" :kind="sharing.kind" @close="sharing = null; refreshUsage()" />
   </DropZone>
 </template>
 

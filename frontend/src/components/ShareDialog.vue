@@ -5,7 +5,9 @@ import { toast } from '../ui/toast'
 import { formatDate } from '../format'
 import FileIcon from './FileIcon.vue'
 
-const props = defineProps({ file: { type: Object, required: true } })
+// kind is the API path segment: 'files' or 'folders'.
+const props = defineProps({ file: { type: Object, required: true }, kind: { type: String, default: 'files' } })
+const what = props.kind === 'folders' ? 'folder' : 'file'
 const emit = defineEmits(['close'])
 
 const el = ref(null)
@@ -17,7 +19,7 @@ const busy = ref(false)
 let downTarget = null
 
 const base = `${location.origin}/s/`
-const sharesUrl = `/api/files/${props.file.id}/shares`
+const sharesUrl = `/api/${props.kind}/${props.file.id}/shares`
 const isExpired = (s) => s.expires_at && new Date(s.expires_at.replace(' ', 'T') + 'Z') <= Date.now()
 
 onMounted(async () => {
@@ -80,10 +82,10 @@ function onClick(e) {
   >
     <div class="body">
       <header>
-        <FileIcon :item="file" :size="36" />
+        <FileIcon :item="file" :folder="kind === 'folders'" :size="36" />
         <div class="head-text">
           <h2 id="share-title">Share “{{ file.name }}”</h2>
-          <p>Anyone with the link can download this file.</p>
+          <p>Anyone with the link can {{ what === 'folder' ? 'browse this folder and download its files' : 'download this file' }}.</p>
         </div>
         <button type="button" class="x" aria-label="Close" @click="el.close()">×</button>
       </header>
@@ -114,7 +116,7 @@ function onClick(e) {
       <section class="links" aria-label="Existing links">
         <h3>Active links <span v-if="shares.length" class="count">{{ shares.length }}</span></h3>
         <p v-if="loading" class="empty">Loading…</p>
-        <p v-else-if="!shares.length" class="empty">No links yet. Create one above to share this file.</p>
+        <p v-else-if="!shares.length" class="empty">No links yet. Create one above to share this {{ what }}.</p>
         <ul v-else>
           <li v-for="s in shares" :key="s.id" :class="{ expired: isExpired(s) }">
             <input class="url" :value="base + s.token" readonly aria-label="Share link" @focus="$event.target.select()" />

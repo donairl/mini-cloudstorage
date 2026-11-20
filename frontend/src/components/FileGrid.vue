@@ -30,6 +30,9 @@ const ICON = {
             <span class="name">{{ d.name }}</span>
           </button>
           <div class="acts">
+            <button type="button" title="Share" :aria-label="`Share ${d.name}`" @click="emit('share', 'folders', d)">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path :d="ICON.share" /></svg>
+            </button>
             <button type="button" title="Rename" :aria-label="`Rename ${d.name}`" @click="emit('rename', 'folders', d)">
               <svg viewBox="0 0 16 16" aria-hidden="true"><path :d="ICON.rename" /></svg>
             </button>
@@ -66,7 +69,7 @@ const ICON = {
             <a :href="'/api/files/download/' + f.id" download title="Download" :aria-label="`Download ${f.name}`">
               <svg viewBox="0 0 16 16" aria-hidden="true"><path :d="ICON.download" /></svg>
             </a>
-            <button type="button" title="Share" :aria-label="`Share ${f.name}`" @click="emit('share', f)">
+            <button type="button" title="Share" :aria-label="`Share ${f.name}`" @click="emit('share', 'files', f)">
               <svg viewBox="0 0 16 16" aria-hidden="true"><path :d="ICON.share" /></svg>
             </button>
             <button type="button" title="Rename" :aria-label="`Rename ${f.name}`" @click="emit('rename', 'files', f)">
@@ -171,7 +174,7 @@ h2 { margin: 0 0 0.6rem; font-size: 0.85rem; font-weight: 600; color: var(--mute
 @media (hover: none) {
   .acts { opacity: 1; }
   .acts button, .acts a { width: 34px; height: 34px; }
-  .folder .open { padding-right: 5.5rem; }
+  .folder .open { padding-right: 8rem; }
 }
 @media (max-width: 400px) {
   .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.5rem; }

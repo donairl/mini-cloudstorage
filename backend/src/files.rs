@@ -35,15 +35,15 @@ pub struct FileRow {
 
 #[derive(Serialize, sqlx::FromRow)]
 pub struct Crumb {
-    id: i64,
+    pub(crate) id: i64,
     name: String,
 }
 
 #[derive(Serialize)]
 pub struct Listing {
-    folders: Vec<Folder>,
-    files: Vec<FileRow>,
-    breadcrumbs: Vec<Crumb>,
+    pub(crate) folders: Vec<Folder>,
+    pub(crate) files: Vec<FileRow>,
+    pub(crate) breadcrumbs: Vec<Crumb>,
 }
 
 #[derive(Serialize)]
@@ -88,7 +88,7 @@ fn clean_name(name: &str) -> Result<String> {
 
 async fn check_folder(db: &SqlitePool, uid: i64, folder: Option<i64>) -> Result<()> {
     let Some(id) = folder else { return Ok(()) };
-    sqlx::query("SELECT 1 FROM folders WHERE id = ? AND user_id = ?")
+    sqlx::query("SELECT 1 FROM folders WHERE id = ? AND user_id = ? AND deleted_at IS NULL")
         .bind(id)
         .bind(uid)
         .fetch_optional(db)
@@ -111,7 +111,7 @@ fn quota_exceeded() -> AppError {
     AppError(StatusCode::INSUFFICIENT_STORAGE, "Storage quota exceeded".into())
 }
 
-/// (used bytes, effective quota); quota None = unlimited.
+/// (used bytes, effective quota); quota None = unlimited. Files in the trash still count until purged.
 async fn usage(app: &App, uid: i64) -> Result<(i64, Option<i64>)> {
     sqlx::query_as(
         "SELECT (SELECT COALESCE(SUM(size_bytes), 0) FROM files WHERE user_id = ?1), COALESCE(quota_bytes, ?2)
@@ -158,7 +158,7 @@ pub async fn list(
         Some(id) => {
             let crumbs: Vec<Crumb> = sqlx::query_as(
                 "WITH RECURSIVE chain(id, name, parent_id, depth) AS (
-                    SELECT id, name, parent_id, 0 FROM folders WHERE id = ? AND user_id = ?
+                    SELECT id, name, parent_id, 0 FROM folders WHERE id = ? AND user_id = ? AND deleted_at IS NULL
                     UNION ALL
                     SELECT f.id, f.name, f.parent_id, c.depth + 1 FROM folders f JOIN chain c ON f.id = c.parent_id
                  )
@@ -176,7 +176,7 @@ pub async fn list(
     };
     let folders = sqlx::query_as(
         "SELECT id, name, parent_id, created_at FROM folders
-         WHERE user_id = ?1 AND CASE WHEN ?3 IS NULL THEN parent_id IS ?2 ELSE name LIKE ?3 ESCAPE '\\' END
+         WHERE user_id = ?1 AND deleted_at IS NULL AND CASE WHEN ?3 IS NULL THEN parent_id IS ?2 ELSE name LIKE ?3 ESCAPE '\\' END
          ORDER BY name COLLATE NOCASE",
     )
     .bind(uid)
@@ -186,7 +186,7 @@ pub async fn list(
     .await?;
     let files = sqlx::query_as(
         "SELECT id, name, mime_type, size_bytes, folder_id, created_at FROM files
-         WHERE user_id = ?1 AND CASE WHEN ?3 IS NULL THEN folder_id IS ?2 ELSE name LIKE ?3 ESCAPE '\\' END
+         WHERE user_id = ?1 AND deleted_at IS NULL AND CASE WHEN ?3 IS NULL THEN folder_id IS ?2 ELSE name LIKE ?3 ESCAPE '\\' END
          ORDER BY name COLLATE NOCASE",
     )
     .bind(uid)
@@ -203,12 +203,15 @@ pub async fn storage(State(app): State<AppState>, AuthUser(uid): AuthUser) -> Re
         "SELECT COUNT(*),
                 COALESCE(SUM(mime_type LIKE 'image/%'), 0),
                 COALESCE(SUM(mime_type LIKE 'video/%'), 0),
-                (SELECT COUNT(*) FROM shares WHERE user_id = ?1 AND (expires_at IS NULL OR expires_at > datetime('now'))),
-                (SELECT COUNT(*) FROM shares WHERE user_id = ?1 AND (expires_at IS NULL OR expires_at > datetime('now'))
+                (SELECT COUNT(*) FROM shares WHERE user_id = ?1 AND (file_id IN (SELECT id FROM files WHERE deleted_at IS NULL)
+                        OR folder_id IN (SELECT id FROM folders WHERE deleted_at IS NULL)) AND (expires_at IS NULL OR expires_at > datetime('now'))),
+                (SELECT COUNT(*) FROM shares WHERE user_id = ?1 AND (file_id IN (SELECT id FROM files WHERE deleted_at IS NULL)
+                        OR folder_id IN (SELECT id FROM folders WHERE deleted_at IS NULL)) AND (expires_at IS NULL OR expires_at > datetime('now'))
                     AND password_hash IS NOT NULL),
-                (SELECT COALESCE(SUM(download_count), 0) FROM shares WHERE user_id = ?1
+                (SELECT COALESCE(SUM(download_count), 0) FROM shares WHERE user_id = ?1 AND (file_id IN (SELECT id FROM files WHERE deleted_at IS NULL)
+                        OR folder_id IN (SELECT id FROM folders WHERE deleted_at IS NULL))
                     AND (expires_at IS NULL OR expires_at > datetime('now')))
-         FROM files WHERE user_id = ?1",
+         FROM files WHERE user_id = ?1 AND deleted_at IS NULL",
     )
     .bind(uid)
     .fetch_one(&app.db)
@@ -282,7 +285,7 @@ pub async fn download(
     headers: HeaderMap,
 ) -> Result<Response> {
     let (name, mime, size, storage_path): (String, String, i64, String) =
-        sqlx::query_as("SELECT name, mime_type, size_bytes, storage_path FROM files WHERE id = ? AND user_id = ?")
+        sqlx::query_as("SELECT name, mime_type, size_bytes, storage_path FROM files WHERE id = ? AND user_id = ? AND deleted_at IS NULL")
             .bind(id)
             .bind(uid)
             .fetch_optional(&app.db)
@@ -346,7 +349,7 @@ pub async fn rename_file(
     Json(r): Json<Rename>,
 ) -> Result<StatusCode> {
     let name = clean_name(&r.name)?;
-    let res = sqlx::query("UPDATE files SET name = ? WHERE id = ? AND user_id = ?")
+    let res = sqlx::query("UPDATE files SET name = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL")
         .bind(name)
         .bind(id)
         .bind(uid)
@@ -355,12 +358,141 @@ pub async fn rename_file(
     not_found_if_zero(res)
 }
 
-pub async fn delete_file(
+// The trash lists, and restore accepts, only trashed items whose parent is still live ("parent_id IS NULL OR
+// parent_id IN (live folders)" below). Anything deeper comes and goes with its trashed ancestor.
+
+#[derive(Serialize)]
+pub struct Trash {
+    folders: Vec<Folder>,
+    files: Vec<FileRow>,
+}
+
+pub async fn trash(State(app): State<AppState>, AuthUser(uid): AuthUser) -> Result<Json<Trash>> {
+    let folders = sqlx::query_as(
+        "SELECT id, name, parent_id, created_at FROM folders
+         WHERE user_id = ? AND deleted_at IS NOT NULL
+           AND (parent_id IS NULL OR parent_id IN (SELECT id FROM folders WHERE deleted_at IS NULL))
+         ORDER BY deleted_at DESC, id DESC",
+    )
+    .bind(uid)
+    .fetch_all(&app.db)
+    .await?;
+    let files = sqlx::query_as(
+        "SELECT id, name, mime_type, size_bytes, folder_id, created_at FROM files
+         WHERE user_id = ? AND deleted_at IS NOT NULL
+           AND (folder_id IS NULL OR folder_id IN (SELECT id FROM folders WHERE deleted_at IS NULL))
+         ORDER BY deleted_at DESC, id DESC",
+    )
+    .bind(uid)
+    .fetch_all(&app.db)
+    .await?;
+    Ok(Json(Trash { folders, files }))
+}
+
+/// Moves a file to the trash.
+pub async fn trash_file(State(app): State<AppState>, AuthUser(uid): AuthUser, Path(id): Path<i64>) -> Result<StatusCode> {
+    let res = sqlx::query(
+        "UPDATE files SET deleted_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
+         WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .bind(uid)
+    .execute(&app.db)
+    .await?;
+    not_found_if_zero(res)
+}
+
+pub async fn restore_file(State(app): State<AppState>, AuthUser(uid): AuthUser, Path(id): Path<i64>) -> Result<StatusCode> {
+    let res = sqlx::query(
+        "UPDATE files SET deleted_at = NULL WHERE id = ? AND user_id = ? AND deleted_at IS NOT NULL
+           AND (folder_id IS NULL OR folder_id IN (SELECT id FROM folders WHERE deleted_at IS NULL))",
+    )
+    .bind(id)
+    .bind(uid)
+    .execute(&app.db)
+    .await?;
+    not_found_if_zero(res)
+}
+
+/// Sets deleted_at to `to` on every row of the folder's subtree whose deleted_at is `from`.
+/// 404 when the folder itself isn't in the `from` state.
+async fn stamp_subtree(
+    conn: &mut sqlx::SqliteConnection,
+    id: i64,
+    uid: i64,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<StatusCode> {
+    macro_rules! in_subtree {
+        ($update:literal) => {
+            concat!(
+                "WITH RECURSIVE sub(id) AS (
+                    SELECT id FROM folders WHERE id = ?1 AND user_id = ?2 AND deleted_at IS ?3
+                    UNION ALL
+                    SELECT f.id FROM folders f JOIN sub ON f.parent_id = sub.id
+                 ) UPDATE ",
+                $update,
+                " IN (SELECT id FROM sub) AND deleted_at IS ?3"
+            )
+        };
+    }
+    // Files first: the folder update changes the root row the CTE starts from.
+    let mut res = None;
+    for sql in [in_subtree!("files SET deleted_at = ?4 WHERE folder_id"), in_subtree!("folders SET deleted_at = ?4 WHERE id")] {
+        res = Some(sqlx::query(sql).bind(id).bind(uid).bind(from).bind(to).execute(&mut *conn).await?);
+    }
+    not_found_if_zero(res.expect("loop ran"))
+}
+
+/// Moves a folder and everything in it to the trash.
+pub async fn trash_folder(State(app): State<AppState>, AuthUser(uid): AuthUser, Path(id): Path<i64>) -> Result<StatusCode> {
+    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let stamp: String = sqlx::query_scalar("SELECT strftime('%Y-%m-%d %H:%M:%f', 'now')").fetch_one(&mut *tx).await?;
+    let status = stamp_subtree(&mut tx, id, uid, None, Some(&stamp)).await?;
+    tx.commit().await?;
+    Ok(status)
+}
+
+pub async fn restore_folder(State(app): State<AppState>, AuthUser(uid): AuthUser, Path(id): Path<i64>) -> Result<StatusCode> {
+    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let stamp: String = sqlx::query_scalar(
+        "SELECT deleted_at FROM folders WHERE id = ? AND user_id = ? AND deleted_at IS NOT NULL
+           AND (parent_id IS NULL OR parent_id IN (SELECT id FROM folders WHERE deleted_at IS NULL))",
+    )
+    .bind(id)
+    .bind(uid)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(AppError::not_found)?;
+    let status = stamp_subtree(&mut tx, id, uid, Some(&stamp), None).await?;
+    tx.commit().await?;
+    Ok(status)
+}
+
+/// Permanently deletes everything in the user's trash.
+pub async fn empty_trash(State(app): State<AppState>, AuthUser(uid): AuthUser) -> Result<StatusCode> {
+    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let paths: Vec<String> =
+        sqlx::query_scalar("DELETE FROM files WHERE user_id = ? AND deleted_at IS NOT NULL RETURNING storage_path")
+            .bind(uid)
+            .fetch_all(&mut *tx)
+            .await?;
+    // Everything under a trashed folder is trashed too, so the cascade removes nothing live.
+    sqlx::query("DELETE FROM folders WHERE user_id = ? AND deleted_at IS NOT NULL").bind(uid).execute(&mut *tx).await?;
+    tx.commit().await?;
+    remove_files(&app, paths).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Permanently deletes a file that is in the trash.
+pub async fn purge_file(
     State(app): State<AppState>,
     AuthUser(uid): AuthUser,
     Path(id): Path<i64>,
 ) -> Result<StatusCode> {
-    let path: String = sqlx::query_scalar("DELETE FROM files WHERE id = ? AND user_id = ? RETURNING storage_path")
+    let path: String = sqlx::query_scalar(
+        "DELETE FROM files WHERE id = ? AND user_id = ? AND deleted_at IS NOT NULL RETURNING storage_path",
+    )
         .bind(id)
         .bind(uid)
         .fetch_optional(&app.db)
@@ -396,7 +528,7 @@ pub async fn rename_folder(
     Json(r): Json<Rename>,
 ) -> Result<StatusCode> {
     let name = clean_name(&r.name)?;
-    let res = sqlx::query("UPDATE folders SET name = ? WHERE id = ? AND user_id = ?")
+    let res = sqlx::query("UPDATE folders SET name = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL")
         .bind(name)
         .bind(id)
         .bind(uid)
@@ -405,7 +537,8 @@ pub async fn rename_folder(
     not_found_if_zero(res)
 }
 
-pub async fn delete_folder(
+/// Permanently deletes a folder that is in the trash, with everything inside.
+pub async fn purge_folder(
     State(app): State<AppState>,
     AuthUser(uid): AuthUser,
     Path(id): Path<i64>,
@@ -414,7 +547,7 @@ pub async fn delete_folder(
     let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
     let paths: Vec<String> = sqlx::query_scalar(
         "WITH RECURSIVE sub(id) AS (
-            SELECT id FROM folders WHERE id = ? AND user_id = ?
+            SELECT id FROM folders WHERE id = ? AND user_id = ? AND deleted_at IS NOT NULL
             UNION ALL
             SELECT f.id FROM folders f JOIN sub ON f.parent_id = sub.id
          )
@@ -424,7 +557,7 @@ pub async fn delete_folder(
     .bind(uid)
     .fetch_all(&mut *tx)
     .await?;
-    let res = sqlx::query("DELETE FROM folders WHERE id = ? AND user_id = ?")
+    let res = sqlx::query("DELETE FROM folders WHERE id = ? AND user_id = ? AND deleted_at IS NOT NULL")
         .bind(id)
         .bind(uid)
         .execute(&mut *tx)
@@ -473,6 +606,8 @@ mod tests {
 
         let id = file["id"].as_i64().unwrap();
         alice.json("DELETE", &format!("/api/files/{id}"), json!({})).await;
+        assert_eq!(storage(&mut alice).await["used_bytes"], 10, "trash still counts toward the quota");
+        alice.json("DELETE", &format!("/api/trash/files/{id}"), json!({})).await;
         assert_eq!(storage(&mut alice).await["used_bytes"], 4);
 
         // concurrent uploads: the conditional INSERT lets only one fit
@@ -542,6 +677,77 @@ mod tests {
         assert_eq!(get("bytes=9-").await.0, StatusCode::RANGE_NOT_SATISFIABLE);
         // unsupported forms fall back to the whole file
         assert_eq!(get("bytes=0-0,2-2").await, (StatusCode::OK, None, Some("5".into()), b"hello".to_vec()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn trash() {
+        let (app, dir, storage_dir) = test_app(1024 * 1024, None).await;
+        let disk = || std::fs::read_dir(&storage_dir).unwrap().count();
+        let mut alice = user(&app, "alice").await;
+        let mut bob = user(&app, "bob").await;
+        let names = |v: &Value| v.as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let f = folder(&mut alice).await;
+        let sub = alice.json("POST", "/api/folders", json!({ "name": "sub", "parent_id": f })).await.1["id"].as_i64().unwrap();
+        let a = alice.upload(f, "a.txt", b"aa").await.1["id"].as_i64().unwrap();
+        alice.upload(sub, "b.txt", b"bb").await;
+        let token = alice.json("POST", &format!("/api/files/{a}/shares"), json!({})).await.1["token"].as_str().unwrap().to_string();
+        let (in_f, in_sub) = (format!("/api/files?folder_id={f}"), format!("/api/files?folder_id={sub}"));
+
+        // a trashed file disappears everywhere but the trash, and keeps its bytes
+        assert_eq!(alice.json("DELETE", &format!("/api/files/{a}"), json!({})).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(alice.json("DELETE", &format!("/api/files/{a}"), json!({})).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(alice.json("GET", &in_f, json!({})).await.1["files"], json!([]));
+        assert_eq!(alice.json("GET", "/api/files?q=a.txt", json!({})).await.1["files"], json!([]));
+        assert_eq!(alice.json("GET", &format!("/api/files/download/{a}"), json!({})).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(alice.json("GET", &format!("/api/s/{token}"), json!({})).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(names(&alice.json("GET", "/api/trash", json!({})).await.1["files"]), ["a.txt"]);
+        let s = alice.json("GET", "/api/storage", json!({})).await.1;
+        assert_eq!((&s["used_bytes"], &s["files"], &s["active_shares"]), (&json!(4), &json!(1), &json!(0)));
+
+        // trashing the folder takes the subtree; only the folder itself is listed
+        assert_eq!(alice.json("DELETE", &format!("/api/folders/{f}"), json!({})).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(alice.json("GET", "/api/files", json!({})).await.1["folders"], json!([]));
+        assert_eq!(alice.json("GET", &in_sub, json!({})).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(alice.json("GET", "/api/files?q=b.txt", json!({})).await.1["files"], json!([]));
+        assert_eq!(alice.upload(f, "x.txt", b"x").await.0, StatusCode::NOT_FOUND);
+        let t = alice.json("GET", "/api/trash", json!({})).await.1;
+        assert_eq!((names(&t["folders"]), names(&t["files"])), (vec!["f".to_string()], vec![]));
+        // nothing inside a trashed folder can be restored on its own
+        assert_eq!(alice.json("POST", &format!("/api/trash/files/{a}"), json!({})).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(alice.json("POST", &format!("/api/trash/folders/{sub}"), json!({})).await.0, StatusCode::NOT_FOUND);
+        // other users can't touch it
+        assert_eq!(bob.json("POST", &format!("/api/trash/folders/{f}"), json!({})).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(bob.json("DELETE", &format!("/api/trash/folders/{f}"), json!({})).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(bob.json("DELETE", "/api/trash", json!({})).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(disk(), 2);
+
+        // restoring the folder brings back what went with it; the file trashed earlier stays in the trash
+        assert_eq!(alice.json("POST", &format!("/api/trash/folders/{f}"), json!({})).await.0, StatusCode::NO_CONTENT);
+        let l = alice.json("GET", &in_f, json!({})).await.1;
+        assert_eq!((names(&l["folders"]), names(&l["files"])), (vec!["sub".to_string()], vec![]));
+        assert_eq!(names(&alice.json("GET", &in_sub, json!({})).await.1["files"]), ["b.txt"]);
+        assert_eq!(names(&alice.json("GET", "/api/trash", json!({})).await.1["files"]), ["a.txt"]);
+        assert_eq!(alice.json("POST", &format!("/api/trash/files/{a}"), json!({})).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(names(&alice.json("GET", &in_f, json!({})).await.1["files"]), ["a.txt"]);
+        assert_eq!(alice.json("GET", &format!("/api/s/{token}"), json!({})).await.0, StatusCode::OK);
+
+        // purge only works on trashed items, and removes the bytes
+        assert_eq!(alice.json("DELETE", &format!("/api/trash/files/{a}"), json!({})).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(alice.json("DELETE", &format!("/api/trash/folders/{f}"), json!({})).await.0, StatusCode::NOT_FOUND);
+        alice.json("DELETE", &format!("/api/files/{a}"), json!({})).await;
+        assert_eq!(alice.json("DELETE", &format!("/api/trash/files/{a}"), json!({})).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(disk(), 1);
+
+        // empty trash
+        let c = alice.upload(f, "c.txt", b"c").await.1["id"].as_i64().unwrap();
+        alice.json("DELETE", &format!("/api/files/{c}"), json!({})).await;
+        alice.json("DELETE", &format!("/api/folders/{sub}"), json!({})).await;
+        assert_eq!(alice.json("DELETE", "/api/trash", json!({})).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(disk(), 0);
+        let t = alice.json("GET", "/api/trash", json!({})).await.1;
+        assert_eq!((&t["folders"], &t["files"]), (&json!([]), &json!([])));
+        assert_eq!(names(&alice.json("GET", "/api/files", json!({})).await.1["folders"]), ["f"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

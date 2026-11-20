@@ -87,16 +87,21 @@ All endpoints except register/login and the public `/api/s/…` share endpoints 
 | POST   | `/api/files/upload?folder_id=`| Upload (multipart field `file`)          |
 | GET    | `/api/files/download/{id}`    | Download a file                          |
 | PATCH  | `/api/files/{id}`             | Rename file `{name}`                     |
-| DELETE | `/api/files/{id}`             | Delete file                              |
+| DELETE | `/api/files/{id}`             | Move file to the trash                   |
 | POST   | `/api/folders`                | Create folder `{name, parent_id?}`       |
 | PATCH  | `/api/folders/{id}`           | Rename folder `{name}`                   |
-| DELETE | `/api/folders/{id}`           | Delete folder and everything inside      |
+| DELETE | `/api/folders/{id}`           | Move folder and everything inside to the trash |
+| GET    | `/api/trash`                  | List trashed files and folders           |
+| DELETE | `/api/trash`                  | Empty the trash (permanent)              |
+| POST   | `/api/trash/{files\|folders}/{id}` | Restore from the trash              |
+| DELETE | `/api/trash/{files\|folders}/{id}` | Delete permanently                  |
 | GET    | `/api/storage`                | `{used_bytes, quota_bytes}` (`null` = unlimited) |
-| POST   | `/api/files/{id}/shares`      | Create share link `{expires_in_days?, password?}` |
-| GET    | `/api/files/{id}/shares`      | List a file's share links                |
+| POST   | `/api/{files\|folders}/{id}/shares` | Create share link `{expires_in_days?, password?}` |
+| GET    | `/api/{files\|folders}/{id}/shares` | List a file's or folder's share links |
 | DELETE | `/api/shares/{id}`            | Revoke a share link                      |
-| GET    | `/api/s/{token}`              | Public: shared file info                 |
+| GET    | `/api/s/{token}`              | Public: shared file or folder info       |
+| POST   | `/api/s/{token}/list`         | Public: list a shared folder `{password?, folder_id?}` |
 | GET    | `/api/s/{token}/download`     | Public: download (no password)           |
 | POST   | `/api/s/{token}/download`     | Public: download, form field `password`  |
 
-Uploads over the quota fail with `507`. Share links open at `/s/{token}` in the frontend.
+Uploads over the quota fail with `507`. Trashed files keep counting toward the quota until deleted permanently, and their share links stop working while they are in the trash. Share links open at `/s/{token}` in the frontend. For a folder share, add `?file_id=` to the download endpoints to pick a file inside the folder.

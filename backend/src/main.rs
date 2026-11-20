@@ -83,13 +83,18 @@ pub fn router(state: AppState) -> Router {
             post(files::upload).layer(DefaultBodyLimit::max(state.max_upload)),
         )
         .route("/files/download/{id}", get(files::download))
-        .route("/files/{id}", patch(files::rename_file).delete(files::delete_file))
+        .route("/files/{id}", patch(files::rename_file).delete(files::trash_file))
         .route("/folders", post(files::create_folder))
-        .route("/folders/{id}", patch(files::rename_folder).delete(files::delete_folder))
+        .route("/folders/{id}", patch(files::rename_folder).delete(files::trash_folder))
+        .route("/trash", get(files::trash).delete(files::empty_trash))
+        .route("/trash/files/{id}", post(files::restore_file).delete(files::purge_file))
+        .route("/trash/folders/{id}", post(files::restore_folder).delete(files::purge_folder))
         .route("/files/{id}/shares", get(shares::list).post(shares::create))
         .route("/shares/{id}", delete(shares::revoke))
         .route("/s/{token}", get(shares::info))
+        .route("/folders/{id}/shares", get(shares::list_folder).post(shares::create_folder))
         .route("/s/{token}/download", get(shares::download).post(shares::unlock))
+        .route("/s/{token}/list", post(shares::browse))
         .fallback(|| async { AppError::not_found() });
     Router::new().nest("/api", api).with_state(state)
 }
@@ -265,9 +270,11 @@ pub(crate) mod tests {
         assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(std::fs::read_dir(&storage_dir).unwrap().count(), 1, "partial upload left on disk");
 
-        // recursive folder delete removes rows and disk files
+        // folder delete trashes the subtree; purging it removes rows and disk files
         assert_eq!(alice.json("DELETE", &format!("/api/folders/{docs}"), json!({})).await.0, StatusCode::NO_CONTENT);
         assert_eq!(alice.json("PATCH", &uri, json!({ "name": "x" })).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(std::fs::read_dir(&storage_dir).unwrap().count(), 1);
+        assert_eq!(alice.json("DELETE", &format!("/api/trash/folders/{docs}"), json!({})).await.0, StatusCode::NO_CONTENT);
         assert_eq!(std::fs::read_dir(&storage_dir).unwrap().count(), 0);
 
         // logout clears cookie
