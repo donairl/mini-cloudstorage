@@ -83,6 +83,7 @@ All endpoints except register/login and the public `/api/s/…` share endpoints 
 | POST   | `/api/auth/logout`            | Clear cookie                             |
 | GET    | `/api/auth/me`                | Current user                             |
 | GET    | `/api/files?folder_id=`       | List folder contents + breadcrumbs       |
+| GET    | `/api/files?q=`               | Search file and folder names in all folders |
 | POST   | `/api/files/upload?folder_id=`| Upload (multipart field `file`)          |
 | GET    | `/api/files/download/{id}`    | Download a file                          |
 | PATCH  | `/api/files/{id}`             | Rename file `{name}`                     |

@@ -60,6 +60,8 @@ pub struct Storage {
 #[derive(Deserialize)]
 pub struct FolderQuery {
     folder_id: Option<i64>,
+    /// Name search across all of the user's folders; when set, folder_id is ignored by `list`.
+    q: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -136,12 +138,19 @@ fn encode_filename(name: &str) -> String {
         .collect()
 }
 
+/// `%term%` with LIKE wildcards in the term escaped (ESCAPE '\\').
+fn like_pattern(term: &str) -> String {
+    format!("%{}%", term.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+}
+
 pub async fn list(
     State(app): State<AppState>,
     AuthUser(uid): AuthUser,
     Query(q): Query<FolderQuery>,
 ) -> Result<Json<Listing>> {
-    let breadcrumbs: Vec<Crumb> = match q.folder_id {
+    // ponytail: LIKE is case-insensitive for ASCII only and scans every row; switch to FTS5 if that matters.
+    let like = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(like_pattern);
+    let breadcrumbs: Vec<Crumb> = match q.folder_id.filter(|_| like.is_none()) {
         None => vec![],
         Some(id) => {
             let crumbs: Vec<Crumb> = sqlx::query_as(
@@ -164,18 +173,22 @@ pub async fn list(
     };
     let folders = sqlx::query_as(
         "SELECT id, name, parent_id, created_at FROM folders
-         WHERE user_id = ? AND parent_id IS ? ORDER BY name COLLATE NOCASE",
+         WHERE user_id = ?1 AND CASE WHEN ?3 IS NULL THEN parent_id IS ?2 ELSE name LIKE ?3 ESCAPE '\\' END
+         ORDER BY name COLLATE NOCASE",
     )
     .bind(uid)
     .bind(q.folder_id)
+    .bind(&like)
     .fetch_all(&app.db)
     .await?;
     let files = sqlx::query_as(
         "SELECT id, name, mime_type, size_bytes, folder_id, created_at FROM files
-         WHERE user_id = ? AND folder_id IS ? ORDER BY name COLLATE NOCASE",
+         WHERE user_id = ?1 AND CASE WHEN ?3 IS NULL THEN folder_id IS ?2 ELSE name LIKE ?3 ESCAPE '\\' END
+         ORDER BY name COLLATE NOCASE",
     )
     .bind(uid)
     .bind(q.folder_id)
+    .bind(&like)
     .fetch_all(&app.db)
     .await?;
     Ok(Json(Listing { folders, files, breadcrumbs }))
@@ -440,6 +453,34 @@ mod tests {
         assert_eq!(bob.upload(bf, "big.txt", &[0u8; 15]).await.0, StatusCode::CREATED);
         db.close().await;
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn search() {
+        let (app, dir, _) = test_app(1024 * 1024, None).await;
+        let mut alice = user(&app, "alice").await;
+        let f = folder(&mut alice).await;
+        alice.json("POST", "/api/folders", json!({ "name": "Reports", "parent_id": f })).await;
+        alice.upload(f, "annual report.txt", b"x").await;
+        alice.upload(f, "100%.txt", b"x").await;
+        alice.upload(f, "a_b.txt", b"x").await;
+        let names = |v: &Value| v.as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+
+        // matches nested files and folders from the root, case-insensitively
+        let r = alice.json("GET", "/api/files?q=REPORT", json!({})).await.1;
+        assert_eq!(names(&r["folders"]), ["Reports"]);
+        assert_eq!(names(&r["files"]), ["annual report.txt"]);
+        assert_eq!(r["breadcrumbs"], json!([]));
+        // wildcards are literal
+        assert_eq!(names(&alice.json("GET", "/api/files?q=%25", json!({})).await.1["files"]), ["100%.txt"]);
+        assert_eq!(names(&alice.json("GET", "/api/files?q=_", json!({})).await.1["files"]), ["a_b.txt"]);
+        // blank query falls back to the normal listing
+        assert_eq!(names(&alice.json("GET", "/api/files?q=%20", json!({})).await.1["folders"]), ["f"]);
+        // other users' files never match
+        let mut bob = user(&app, "bob").await;
+        let r = bob.json("GET", "/api/files?q=report", json!({})).await.1;
+        assert_eq!((&r["folders"], &r["files"]), (&json!([]), &json!([])));
         let _ = std::fs::remove_dir_all(dir);
     }
 

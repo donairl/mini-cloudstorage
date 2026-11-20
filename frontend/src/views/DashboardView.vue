@@ -19,6 +19,20 @@ const router = useRouter()
 const auth = useAuth()
 
 const folderId = computed(() => route.query.folder || null)
+// Search is global (all folders); the folder stays in the URL so clearing the box returns to it.
+const search = computed(() => (route.query.q || '').trim())
+const term = ref(route.query.q || '')
+watch(() => route.query.q, (q) => {
+  if ((q || '') !== term.value.trim()) term.value = q || ''
+})
+let searchTimer
+watch(term, (t) => {
+  clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => {
+    const q = t.trim()
+    if (q !== search.value) router.replace({ query: { ...route.query, q: q || undefined } })
+  }, 250)
+})
 const folders = ref([])
 const files = ref([])
 const breadcrumbs = ref([])
@@ -48,17 +62,21 @@ function readView() {
 
 async function load() {
   const id = folderId.value
+  const q = search.value
+  const stale = () => id !== folderId.value || q !== search.value
   loading.value = true
   error.value = ''
   try {
-    const q = id ? `?folder_id=${encodeURIComponent(id)}` : ''
-    const data = await api.get('/api/files' + q)
-    if (id !== folderId.value) return // user navigated away; a newer load owns the view
+    const params = new URLSearchParams()
+    if (q) params.set('q', q)
+    else if (id) params.set('folder_id', id)
+    const data = await api.get('/api/files?' + params)
+    if (stale()) return // user navigated away; a newer load owns the view
     folders.value = data.folders
     files.value = data.files
     breadcrumbs.value = data.breadcrumbs
   } catch (e) {
-    if (id !== folderId.value) return
+    if (stale()) return
     folders.value = []
     files.value = []
     breadcrumbs.value = []
@@ -67,7 +85,7 @@ async function load() {
     loading.value = false
   }
 }
-watch(folderId, load, { immediate: true })
+watch([folderId, search], load, { immediate: true })
 
 // Runs an action, toasts the outcome, reloads the listing.
 async function run(fn, success) {
@@ -157,7 +175,8 @@ async function logout() {
       <StatsCards v-if="!folderId" ref="stats" />
       <div class="toolbar">
         <nav class="crumbs" aria-label="Breadcrumb">
-          <RouterLink v-if="breadcrumbs.length" :to="{ query: {} }">Home</RouterLink>
+          <span v-if="search" aria-current="page">Search results for “{{ search }}”</span>
+          <RouterLink v-else-if="breadcrumbs.length" :to="{ query: {} }">Home</RouterLink>
           <span v-else aria-current="page">Home</span>
           <template v-for="(b, i) in breadcrumbs" :key="b.id">
             <span class="sep" aria-hidden="true">&gt;</span>
@@ -166,6 +185,7 @@ async function logout() {
           </template>
         </nav>
         <div class="actions">
+          <input v-model="term" type="search" class="search" placeholder="Search all files" aria-label="Search all files" />
           <div class="views" role="group" aria-label="View">
             <button type="button" :aria-pressed="view === 'list'" title="List view" @click="view = 'list'">
               <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h14M3 10h14M3 15h14" /></svg>
@@ -246,6 +266,7 @@ async function logout() {
           </tr>
         </tbody>
       </table>
+      <p v-else-if="search && !loading && !error" class="no-results">No files or folders match “{{ search }}”.</p>
       <EmptyState v-else-if="!loading && !error" @upload="fileInput.click()" @new-folder="newFolder" />
     </main>
 
@@ -286,7 +307,9 @@ async function logout() {
 .crumbs a { text-decoration: none; }
 .crumbs a:hover { text-decoration: underline; }
 .sep { color: var(--muted); }
-.actions { display: flex; gap: 0.5rem; }
+.actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.search { width: 14rem; max-width: 100%; }
+.no-results { padding: 2rem 0; text-align: center; color: var(--muted); }
 .uploads {
   list-style: none;
   margin: 0 0 1rem;
