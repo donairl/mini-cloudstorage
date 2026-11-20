@@ -4,6 +4,7 @@ import LoginView from './views/LoginView.vue'
 import DashboardView from './views/DashboardView.vue'
 import SharedView from './views/SharedView.vue'
 import TrashView from './views/TrashView.vue'
+import AboutView from './views/AboutView.vue'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -11,6 +12,7 @@ const router = createRouter({
     { path: '/login', component: LoginView },
     { path: '/', component: DashboardView },
     { path: '/trash', component: TrashView },
+    { path: '/about', component: AboutView },
     { path: '/s/:token', component: SharedView, meta: { public: true } },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],

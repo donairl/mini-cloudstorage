@@ -169,6 +169,7 @@ async function logout() {
       <strong class="brand">Mini-Drive</strong>
       <StorageMeter ref="meter" class="topbar-meter" />
       <RouterLink to="/trash">Trash</RouterLink>
+      <RouterLink to="/about">About</RouterLink>
       <span class="user">{{ auth.user?.username }}</span>
       <button type="button" @click="logout">Logout</button>
     </header>
