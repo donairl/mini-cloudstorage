@@ -1,6 +1,7 @@
 <script setup>
 import FileIcon, { fileColor } from './FileIcon.vue'
 import { formatSize, formatDate } from '../format'
+import { previewKind } from './FilePreview.vue'
 
 defineProps({
   folders: { type: Array, default: () => [] },
@@ -47,6 +48,9 @@ const ICON = {
           <button v-if="isImage(f)" type="button" class="thumb" :aria-label="`Preview ${f.name}`" @click="emit('preview', f)">
             <!-- ponytail: thumbnail is the full original, add server-side thumbnails if large photos make the grid slow -->
             <img :src="'/api/files/download/' + f.id" loading="lazy" alt="" />
+          </button>
+          <button v-else-if="previewKind(f)" type="button" class="thumb" :style="tint(f)" :aria-label="`Preview ${f.name}`" @click="emit('preview', f)">
+            <FileIcon :item="f" :size="48" />
           </button>
           <div v-else class="thumb" :style="tint(f)">
             <FileIcon :item="f" :size="48" />

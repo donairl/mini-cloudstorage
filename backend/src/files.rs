@@ -2,12 +2,15 @@ use axum::{
     Json,
     body::Body,
     extract::{Multipart, Path, Query, State},
-    http::{StatusCode, header},
-    response::IntoResponse,
+    http::{HeaderMap, StatusCode, header},
+    response::Response,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use tokio::{fs::File, io::AsyncWriteExt};
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+};
 use tokio_util::io::ReaderStream;
 
 use crate::{App, AppError, AppState, Result, auth::AuthUser};
@@ -276,7 +279,8 @@ pub async fn download(
     State(app): State<AppState>,
     AuthUser(uid): AuthUser,
     Path(id): Path<i64>,
-) -> Result<impl IntoResponse> {
+    headers: HeaderMap,
+) -> Result<Response> {
     let (name, mime, size, storage_path): (String, String, i64, String) =
         sqlx::query_as("SELECT name, mime_type, size_bytes, storage_path FROM files WHERE id = ? AND user_id = ?")
             .bind(id)
@@ -284,19 +288,55 @@ pub async fn download(
             .fetch_optional(&app.db)
             .await?
             .ok_or_else(AppError::not_found)?;
-    stream_file(&app, &name, mime, size, &storage_path).await
+    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    stream_file(&app, &name, mime, size, &storage_path, range).await
 }
 
-/// Streams a stored file as an attachment download.
-pub(crate) async fn stream_file(app: &App, name: &str, mime: String, size: i64, storage_path: &str) -> Result<impl IntoResponse + use<>> {
-    let file = File::open(app.storage_dir.join(storage_path)).await?;
-    let headers = [
-        (header::CONTENT_TYPE, mime),
-        (header::CONTENT_LENGTH, size.to_string()),
-        (header::CONTENT_DISPOSITION, format!("attachment; filename*=UTF-8''{}", encode_filename(name))),
-        (header::X_CONTENT_TYPE_OPTIONS, "nosniff".into()),
-    ];
-    Ok((headers, Body::from_stream(ReaderStream::new(file))))
+/// Inclusive byte span for a `Range` header value. `Ok(None)` = serve the whole file (no usable range:
+/// malformed, other unit, or multi-range, which we don't support); `Err` = range is outside the file.
+fn parse_range(range: &str, size: u64) -> std::result::Result<Option<(u64, u64)>, ()> {
+    let Some((start, end)) = range.trim().strip_prefix("bytes=").and_then(|r| r.split_once('-')) else {
+        return Ok(None);
+    };
+    let span = match (start.trim().parse::<u64>(), end.trim().parse::<u64>()) {
+        (Ok(s), Ok(e)) => (s, e.min(size.saturating_sub(1))),
+        (Ok(s), Err(_)) if end.trim().is_empty() => (s, size.saturating_sub(1)),
+        // suffix form: the last n bytes
+        (Err(_), Ok(n)) if start.trim().is_empty() => (size.saturating_sub(n), size.saturating_sub(1)),
+        _ => return Ok(None),
+    };
+    if span.0 >= size || span.0 > span.1 { Err(()) } else { Ok(Some(span)) }
+}
+
+/// Streams a stored file as an attachment download; `range` is the request's `Range` header, if any.
+pub(crate) async fn stream_file(
+    app: &App,
+    name: &str,
+    mime: String,
+    size: i64,
+    storage_path: &str,
+    range: Option<&str>,
+) -> Result<Response> {
+    let size = size as u64;
+    let span = range
+        .map_or(Ok(None), |r| parse_range(r, size))
+        .map_err(|_| AppError(StatusCode::RANGE_NOT_SATISFIABLE, "range not satisfiable".into()))?;
+    let (start, end) = span.unwrap_or((0, size.saturating_sub(1)));
+    let len = if size == 0 { 0 } else { end - start + 1 };
+    let mut file = File::open(app.storage_dir.join(storage_path)).await?;
+    file.seek(std::io::SeekFrom::Start(start)).await?;
+
+    let mut res = Response::builder()
+        .status(if span.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK })
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CONTENT_LENGTH, len)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_DISPOSITION, format!("attachment; filename*=UTF-8''{}", encode_filename(name)))
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    if span.is_some() {
+        res = res.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"));
+    }
+    res.body(Body::from_stream(ReaderStream::new(file.take(len)))).map_err(|e| AppError::bad(&e.to_string()))
 }
 
 pub async fn rename_file(
@@ -453,6 +493,55 @@ mod tests {
         assert_eq!(bob.upload(bf, "big.txt", &[0u8; 15]).await.0, StatusCode::CREATED);
         db.close().await;
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn range_parsing() {
+        use super::parse_range;
+        assert_eq!(parse_range("bytes=1-3", 5), Ok(Some((1, 3))));
+        assert_eq!(parse_range("bytes=2-", 5), Ok(Some((2, 4))));
+        assert_eq!(parse_range("bytes=-2", 5), Ok(Some((3, 4))));
+        assert_eq!(parse_range("bytes=-99", 5), Ok(Some((0, 4))));
+        assert_eq!(parse_range("bytes=3-99", 5), Ok(Some((3, 4))), "end is clamped");
+        assert_eq!(parse_range("bytes=5-", 5), Err(()));
+        assert_eq!(parse_range("bytes=3-1", 5), Err(()));
+        assert_eq!(parse_range("bytes=-0", 5), Err(()));
+        assert_eq!(parse_range("bytes=0-", 0), Err(()));
+        for whole in ["bytes=0-1,3-4", "items=0-1", "bytes=a-b", "bytes=", "bytes=-"] {
+            assert_eq!(parse_range(whole, 5), Ok(None), "{whole}");
+        }
+    }
+
+    #[tokio::test]
+    async fn range_download() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let (app, dir, _) = test_app(1024 * 1024, None).await;
+        let mut alice = user(&app, "alice").await;
+        let f = folder(&mut alice).await;
+        let id = alice.upload(f, "a.txt", b"hello").await.1["id"].as_i64().unwrap();
+        let get = async |range: &str| {
+            let req = Request::get(format!("/api/files/download/{id}"))
+                .header("cookie", alice.cookie.as_deref().unwrap())
+                .header("range", range)
+                .body(Body::empty())
+                .unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            let h = |k: &str| res.headers().get(k).map(|v| v.to_str().unwrap().to_string());
+            let (status, crange, clen) = (res.status(), h("content-range"), h("content-length"));
+            (status, crange, clen, res.into_body().collect().await.unwrap().to_bytes().to_vec())
+        };
+        assert_eq!(
+            get("bytes=1-3").await,
+            (StatusCode::PARTIAL_CONTENT, Some("bytes 1-3/5".into()), Some("3".into()), b"ell".to_vec())
+        );
+        assert_eq!(get("bytes=-2").await.3, b"lo");
+        assert_eq!(get("bytes=9-").await.0, StatusCode::RANGE_NOT_SATISFIABLE);
+        // unsupported forms fall back to the whole file
+        assert_eq!(get("bytes=0-0,2-2").await, (StatusCode::OK, None, Some("5".into()), b"hello".to_vec()));
         let _ = std::fs::remove_dir_all(dir);
     }
 

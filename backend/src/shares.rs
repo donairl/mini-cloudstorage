@@ -6,7 +6,7 @@ use axum::{
     Form, Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use serde::{Deserialize, Serialize};
 
@@ -77,7 +77,8 @@ async fn find(app: &AppState, token: &str) -> Result<Shared> {
 }
 
 async fn stream(app: &AppState, s: Shared, count: bool) -> Result<Response> {
-    let res = stream_file(app, &s.name, s.mime_type, s.size_bytes, &s.storage_path).await?.into_response();
+    // No Range here: a ranged share download would be counted once per chunk.
+    let res = stream_file(app, &s.name, s.mime_type, s.size_bytes, &s.storage_path, None).await?;
     if count {
         sqlx::query("UPDATE shares SET download_count = download_count + 1 WHERE id = ?")
             .bind(s.id)

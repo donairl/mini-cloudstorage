@@ -25,7 +25,7 @@ const EXT = {
   code: 'txt md json js mjs cjs ts jsx tsx vue html htm css scss xml yml yaml toml ini sh py rb go rs java kt c h cpp hpp cs php sql log',
 }
 
-function kindOf(f) {
+export function kindOf(f) {
   const m = f.mime_type || ''
   const top = m.split('/')[0]
   if (top === 'image' || top === 'video' || top === 'audio') return top

@@ -9,6 +9,7 @@ import DropZone from '../components/DropZone.vue'
 import EmptyState from '../components/EmptyState.vue'
 import FileGrid from '../components/FileGrid.vue'
 import FileIcon from '../components/FileIcon.vue'
+import FilePreview, { previewKind } from '../components/FilePreview.vue'
 import ShareDialog from '../components/ShareDialog.vue'
 import StorageMeter from '../components/StorageMeter.vue'
 import StatsCards from '../components/StatsCards.vue'
@@ -48,7 +49,6 @@ const refreshUsage = () => {
   meter.value?.refresh()
   stats.value?.refresh()
 }
-const vFocus = { mounted: (el) => el.focus() }
 
 const isImage = (f) => f.mime_type.startsWith('image/')
 
@@ -253,7 +253,8 @@ async function logout() {
                 <img :src="'/api/files/download/' + f.id" alt="" loading="lazy" />
               </button>
               <FileIcon v-else :item="f" class="icon" />
-              {{ f.name }}
+              <button v-if="previewKind(f)" type="button" class="link" title="Preview" @click="preview = f">{{ f.name }}</button>
+              <template v-else>{{ f.name }}</template>
             </td>
             <td class="num">{{ formatSize(f.size_bytes) }}</td>
             <td class="date">{{ formatDate(f.created_at) }}</td>
@@ -270,15 +271,7 @@ async function logout() {
       <EmptyState v-else-if="!loading && !error" @upload="fileInput.click()" @new-folder="newFolder" />
     </main>
 
-    <div v-if="preview" class="lightbox" role="dialog" aria-modal="true" :aria-label="preview.name" @click.self="preview = null" @keydown.esc="preview = null">
-      <figure>
-        <img :src="'/api/files/download/' + preview.id" :alt="preview.name" />
-        <figcaption>
-          {{ preview.name }}
-          <button type="button" @click="preview = null" v-focus>Close</button>
-        </figcaption>
-      </figure>
-    </div>
+    <FilePreview v-if="preview" :file="preview" @close="preview = null" />
     <ShareDialog v-if="sharing" :file="sharing" @close="sharing = null; refreshUsage()" />
   </DropZone>
 </template>
@@ -334,6 +327,7 @@ th { font-size: 0.85rem; font-weight: 600; color: var(--muted); }
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover { background: var(--bg); }
 td.name { word-break: break-all; }
+td.name .icon { display: inline-block; }
 .icon { margin-right: 0.6rem; vertical-align: middle; }
 .views { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
 .views button { display: grid; place-items: center; padding: 0.4rem 0.55rem; border: 0; border-radius: 0; color: var(--muted); }
@@ -351,26 +345,6 @@ td.name { word-break: break-all; }
   background: var(--bg);
 }
 .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.lightbox {
-  position: fixed;
-  inset: 0;
-  z-index: 10;
-  display: grid;
-  place-items: center;
-  padding: 1rem;
-  background: rgba(0, 0, 0, 0.8);
-}
-.lightbox figure { margin: 0; max-width: 100%; }
-.lightbox img { display: block; max-width: 100%; max-height: 80vh; margin: 0 auto; border-radius: 6px; }
-.lightbox figcaption {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  margin-top: 0.75rem;
-  color: #fff;
-  word-break: break-all;
-}
 .num { text-align: right; white-space: nowrap; }
 .date { white-space: nowrap; color: var(--muted); }
 .row-actions { text-align: right; white-space: nowrap; }
