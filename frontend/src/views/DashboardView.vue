@@ -244,6 +244,7 @@ async function logout() {
             <td class="num">—</td>
             <td class="date">{{ formatDate(f.created_at) }}</td>
             <td class="row-actions">
+              <a class="btn" :href="`/api/folders/${f.id}/zip`" download :aria-label="`Download ${f.name} as zip`">Download</a>
               <button type="button" @click="sharing = { kind: 'folders', item: f }" :aria-label="`Share ${f.name}`">Share</button>
               <button type="button" @click="rename('folders', f)" :aria-label="`Rename ${f.name}`">Rename</button>
               <button type="button" class="danger" @click="remove('folders', f)" :aria-label="`Delete ${f.name}`">Delete</button>

@@ -30,6 +30,9 @@ const ICON = {
             <span class="name">{{ d.name }}</span>
           </button>
           <div class="acts">
+            <a :href="`/api/folders/${d.id}/zip`" download title="Download as zip" :aria-label="`Download ${d.name} as zip`">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path :d="ICON.download" /></svg>
+            </a>
             <button type="button" title="Share" :aria-label="`Share ${d.name}`" @click="emit('share', 'folders', d)">
               <svg viewBox="0 0 16 16" aria-hidden="true"><path :d="ICON.share" /></svg>
             </button>
@@ -174,7 +177,7 @@ h2 { margin: 0 0 0.6rem; font-size: 0.85rem; font-weight: 600; color: var(--mute
 @media (hover: none) {
   .acts { opacity: 1; }
   .acts button, .acts a { width: 34px; height: 34px; }
-  .folder .open { padding-right: 8rem; }
+  .folder .open { padding-right: 10.5rem; }
 }
 @media (max-width: 400px) {
   .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.5rem; }

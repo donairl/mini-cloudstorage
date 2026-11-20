@@ -95,11 +95,13 @@ All endpoints except register/login and the public `/api/s/…` share endpoints 
 | DELETE | `/api/trash`                  | Empty the trash (permanent)              |
 | POST   | `/api/trash/{files\|folders}/{id}` | Restore from the trash              |
 | DELETE | `/api/trash/{files\|folders}/{id}` | Delete permanently                  |
+| GET    | `/api/folders/{id}/zip`       | Download folder and everything inside as a zip |
 | GET    | `/api/storage`                | `{used_bytes, quota_bytes}` (`null` = unlimited) |
 | POST   | `/api/{files\|folders}/{id}/shares` | Create share link `{expires_in_days?, password?}` |
 | GET    | `/api/{files\|folders}/{id}/shares` | List a file's or folder's share links |
 | DELETE | `/api/shares/{id}`            | Revoke a share link                      |
 | GET    | `/api/s/{token}`              | Public: shared file or folder info       |
+| GET/POST | `/api/s/{token}/zip`        | Public: shared folder as a zip (POST with form field `password`) |
 | POST   | `/api/s/{token}/list`         | Public: list a shared folder `{password?, folder_id?}` |
 | GET    | `/api/s/{token}/download`     | Public: download (no password)           |
 | POST   | `/api/s/{token}/download`     | Public: download, form field `password`  |

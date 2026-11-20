@@ -116,6 +116,11 @@ function onFrameLoad() {
               <span v-if="i === listing.breadcrumbs.length - 1" aria-current="page">{{ b.name }}</span>
               <button v-else type="button" class="plain" @click="browse(b.id)">{{ b.name }}</button>
             </template>
+            <a v-if="!file.password_required" class="dl all" :href="`/api/s/${token}/zip`" download>Download all (.zip)</a>
+            <form v-else class="all" method="post" :action="`/api/s/${token}/zip`" target="share-dl">
+              <input type="hidden" name="password" :value="password" />
+              <button type="submit" class="dl">Download all (.zip)</button>
+            </form>
           </nav>
           <ul class="entries">
             <li v-for="d in listing.folders" :key="'d' + d.id">
@@ -292,6 +297,7 @@ h1 { margin: 0; font-size: 1.25rem; line-height: 1.3; letter-spacing: -0.01em; }
 
 .browser { width: 100%; text-align: left; }
 .crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem; margin-bottom: 0.6rem; font-size: 0.9rem; }
+.all { margin-left: auto; }
 .plain { padding: 0; border: 0; background: none; color: var(--accent); text-align: left; }
 .plain:hover { background: none; text-decoration: underline; }
 .entries { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); border-radius: 8px; }

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AppError, AppState, Result,
     auth::AuthUser,
-    files::{Crumb, Listing, stream_file},
+    files::{Crumb, Listing, stream_file, zip_folder},
 };
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -258,6 +258,25 @@ pub async fn unlock(
     stream(&app, s, o.file_id, true).await
 }
 
+/// Whole shared folder as a zip; counts as one download.
+async fn stream_zip(app: &AppState, s: Shared) -> Result<Response> {
+    let res = zip_folder(app, s.folder_id.ok_or_else(AppError::not_found)?).await?;
+    sqlx::query("UPDATE shares SET download_count = download_count + 1 WHERE id = ?").bind(s.id).execute(&app.db).await?;
+    Ok(res)
+}
+
+pub async fn zip(State(app): State<AppState>, Path(token): Path<String>) -> Result<Response> {
+    let s = find(&app, &token).await?;
+    check_password(&s, None).await?;
+    stream_zip(&app, s).await
+}
+
+pub async fn unlock_zip(State(app): State<AppState>, Path(token): Path<String>, Form(u): Form<Unlock>) -> Result<Response> {
+    let s = find(&app, &token).await?;
+    check_password(&s, Some(u.password)).await?;
+    stream_zip(&app, s).await
+}
+
 /// Public listing of a shared folder. POST so the password stays out of URLs and logs.
 pub async fn browse(
     State(app): State<AppState>,
@@ -415,6 +434,15 @@ mod tests {
         assert_eq!((s, b.as_slice()), (StatusCode::OK, &b"deep"[..]));
         assert_eq!(anon.send("POST", &get(secret), form, Body::from("password=s3cret")).await.0, StatusCode::NOT_FOUND);
         assert_eq!(anon.send("POST", &format!("{base}/download"), form, Body::from("password=s3cret")).await.0, StatusCode::BAD_REQUEST);
+        // whole folder as a zip, behind the same password
+        assert_eq!(anon.send("GET", &format!("{base}/zip"), "", Body::empty()).await.0, StatusCode::FORBIDDEN);
+        let (s, z) = anon.send("POST", &format!("{base}/zip"), form, Body::from("password=s3cret")).await;
+        assert_eq!(s, StatusCode::OK);
+        let z = zip::ZipArchive::new(std::io::Cursor::new(z)).unwrap();
+        let mut names: Vec<String> = z.file_names().map(|n| n.unwrap().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["Docs/", "Docs/Sub/", "Docs/Sub/inner.txt", "Docs/hello.txt"]);
+        assert_eq!(anon.send("GET", &format!("/api/s/{token}/zip"), "", Body::empty()).await.0, StatusCode::NOT_FOUND);
         // a file share can't be pointed at another file, or browsed
         assert_eq!(anon.send("GET", &format!("/api/s/{token}/download?file_id={secret}"), "", Body::empty()).await.1, b"hello");
         assert_eq!(anon.json("POST", &format!("/api/s/{token}/list"), json!({})).await.0, StatusCode::NOT_FOUND);

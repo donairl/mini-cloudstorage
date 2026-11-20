@@ -11,7 +11,7 @@ use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
 };
-use tokio_util::io::ReaderStream;
+use tokio_util::io::{ReaderStream, SyncIoBridge};
 
 use crate::{App, AppError, AppState, Result, auth::AuthUser};
 
@@ -356,6 +356,93 @@ pub async fn rename_file(
         .execute(&app.db)
         .await?;
     not_found_if_zero(res)
+}
+
+pub async fn download_folder(
+    State(app): State<AppState>,
+    AuthUser(uid): AuthUser,
+    Path(id): Path<i64>,
+) -> Result<Response> {
+    check_folder(&app.db, uid, Some(id)).await?;
+    zip_folder(&app, id).await
+}
+
+/// Entry names for the zip: no `.`/`..` segments (zip-slip), and a ` (2)` style suffix when a name repeats,
+/// since nothing stops a folder from holding two files with the same name.
+fn zip_names(paths: impl Iterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    paths
+        .map(|p| {
+            let safe = p.split('/').map(|s| if s == "." || s == ".." { "_" } else { s }).collect::<Vec<_>>().join("/");
+            let (dir, name) = safe.rsplit_once('/').map_or(("", safe.as_str()), |(d, n)| (d, n));
+            let (stem, ext) = name.rfind('.').filter(|&i| i > 0).map_or((name, ""), |i| name.split_at(i));
+            let sep = if dir.is_empty() { "" } else { "/" };
+            (1..)
+                .map(|n| if n == 1 { safe.clone() } else { format!("{dir}{sep}{stem} ({n}){ext}") })
+                .find(|c| seen.insert(c.clone()))
+                .expect("some suffix is unused")
+        })
+        .collect()
+}
+
+/// Streams the live contents of a folder as a zip. The caller has already checked access to `root`.
+pub(crate) async fn zip_folder(app: &App, root: i64) -> Result<Response> {
+    // (path in the zip, storage path, size); folders come back with a trailing '/' and no storage path.
+    let rows: Vec<(String, Option<String>, i64)> = sqlx::query_as(
+        "WITH RECURSIVE sub(id, path) AS (
+            SELECT id, name FROM folders WHERE id = ?1 AND deleted_at IS NULL
+            UNION ALL
+            SELECT f.id, sub.path || '/' || f.name FROM folders f JOIN sub ON f.parent_id = sub.id
+            WHERE f.deleted_at IS NULL
+         )
+         SELECT path || '/', NULL, 0 FROM sub
+         UNION ALL
+         SELECT sub.path || '/' || fl.name, fl.storage_path, fl.size_bytes FROM files fl JOIN sub ON fl.folder_id = sub.id
+         WHERE fl.deleted_at IS NULL
+         ORDER BY 1",
+    )
+    .bind(root)
+    .fetch_all(&app.db)
+    .await?;
+    // The root folder sorts first: its path is a prefix of every other one.
+    let name = rows.first().ok_or_else(AppError::not_found)?.0.trim_end_matches('/').to_string();
+    let files = rows.iter().filter(|r| r.1.is_some()).map(|r| r.0.clone());
+    let names = zip_names(files);
+    let dirs: Vec<String> = zip_names(rows.iter().filter(|r| r.1.is_none()).map(|r| r.0.trim_end_matches('/').to_string()));
+    let files: Vec<(String, std::path::PathBuf, i64)> = rows
+        .into_iter()
+        .filter_map(|r| r.1.map(|p| (app.storage_dir.join(p), r.2)))
+        .zip(names)
+        .map(|((path, size), name)| (name, path, size))
+        .collect();
+
+    // The zip crate is synchronous: write on a blocking thread into a pipe and stream the other end.
+    let (tx, rx) = tokio::io::duplex(64 * 1024);
+    tokio::task::spawn_blocking(move || {
+        let mut zip = zip::ZipWriter::new_stream(SyncIoBridge::new(tx));
+        let opts = zip::write::SimpleFileOptions::default();
+        let res = (|| -> std::result::Result<(), Box<dyn std::error::Error>> {
+            for dir in dirs {
+                zip.add_directory(dir, opts)?;
+            }
+            for (name, path, size) in files {
+                zip.start_file(name, opts.large_file(size >= u32::MAX as i64))?;
+                std::io::copy(&mut std::fs::File::open(path)?, &mut zip)?;
+            }
+            zip.finish()?;
+            Ok(())
+        })();
+        // Headers are already sent, so all we can do is cut the stream short (also what a client hang-up looks like).
+        if let Err(e) = res {
+            tracing::warn!("zip stream aborted: {e}");
+        }
+    });
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/zip")
+        .header(header::CONTENT_DISPOSITION, format!("attachment; filename*=UTF-8''{}.zip", encode_filename(&name)))
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .body(Body::from_stream(ReaderStream::new(rx)))
+        .map_err(|e| AppError::bad(&e.to_string()))
 }
 
 // The trash lists, and restore accepts, only trashed items whose parent is still live ("parent_id IS NULL OR
@@ -748,6 +835,57 @@ mod tests {
         let t = alice.json("GET", "/api/trash", json!({})).await.1;
         assert_eq!((&t["folders"], &t["files"]), (&json!([]), &json!([])));
         assert_eq!(names(&alice.json("GET", "/api/files", json!({})).await.1["folders"]), ["f"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn zip_entry_names() {
+        let names = |v: &[&str]| super::zip_names(v.iter().map(|s| s.to_string()));
+        assert_eq!(names(&["f/a.txt", "f/a.txt", "f/a.txt", "f/noext", "f/noext", "f/.env", "f/.env"]), [
+            "f/a.txt", "f/a (2).txt", "f/a (3).txt", "f/noext", "f/noext (2)", "f/.env", "f/.env (2)"
+        ]);
+        assert_eq!(names(&["f/../x", "../y", "f/./z"]), ["f/_/x", "_/y", "f/_/z"]);
+    }
+
+    #[tokio::test]
+    async fn zip_download() {
+        use std::io::Read;
+        let (app, dir, _) = test_app(1024 * 1024, None).await;
+        let mut alice = user(&app, "alice").await;
+        let f = folder(&mut alice).await;
+        let mk = async |c: &mut Client, name: &str, parent: i64| {
+            c.json("POST", "/api/folders", json!({ "name": name, "parent_id": parent })).await.1["id"].as_i64().unwrap()
+        };
+        let sub = mk(&mut alice, "sub", f).await;
+        mk(&mut alice, "empty", f).await;
+        let gone = mk(&mut alice, "gone", f).await;
+        alice.upload(f, "a.txt", b"first").await;
+        alice.upload(f, "a.txt", b"second").await;
+        alice.upload(sub, "b.txt", &[b'x'; 5000]).await;
+        alice.upload(gone, "c.txt", b"c").await;
+        let trashed = alice.upload(sub, "t.txt", b"t").await.1["id"].as_i64().unwrap();
+        alice.json("DELETE", &format!("/api/files/{trashed}"), json!({})).await;
+        alice.json("DELETE", &format!("/api/folders/{gone}"), json!({})).await;
+
+        let (s, bytes) = alice.send("GET", &format!("/api/folders/{f}/zip"), "", axum::body::Body::empty()).await;
+        assert_eq!(s, StatusCode::OK);
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut names: Vec<String> = zip.file_names().map(|n| n.unwrap().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["f/", "f/a (2).txt", "f/a.txt", "f/empty/", "f/sub/", "f/sub/b.txt"]);
+        let mut read = |name: &str| {
+            let mut out = Vec::new();
+            zip.by_name(name).unwrap().read_to_end(&mut out).unwrap();
+            out
+        };
+        let mut dupes = [read("f/a.txt"), read("f/a (2).txt")];
+        dupes.sort();
+        assert_eq!(dupes, [b"first".to_vec(), b"second".to_vec()]);
+        assert_eq!(read("f/sub/b.txt"), [b'x'; 5000]);
+
+        let mut bob = user(&app, "bob").await;
+        assert_eq!(bob.json("GET", &format!("/api/folders/{f}/zip"), json!({})).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(alice.json("GET", &format!("/api/folders/{gone}/zip"), json!({})).await.0, StatusCode::NOT_FOUND);
         let _ = std::fs::remove_dir_all(dir);
     }
 

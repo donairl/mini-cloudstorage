@@ -95,6 +95,8 @@ pub fn router(state: AppState) -> Router {
         .route("/folders/{id}/shares", get(shares::list_folder).post(shares::create_folder))
         .route("/s/{token}/download", get(shares::download).post(shares::unlock))
         .route("/s/{token}/list", post(shares::browse))
+        .route("/s/{token}/zip", get(shares::zip).post(shares::unlock_zip))
+        .route("/folders/{id}/zip", get(files::download_folder))
         .fallback(|| async { AppError::not_found() });
     Router::new().nest("/api", api).with_state(state)
 }
